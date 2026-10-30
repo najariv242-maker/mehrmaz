@@ -1,0 +1,123 @@
+name: Course Schedule Sync
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+      - master
+    paths:
+      - ".github/workflows/**"
+      - "**.py"
+      - "requirements.txt"
+      - "run_workflow.sh"
+  schedule:
+    # اجرای دوره‌ای منظم هر ۳۰ دقیقه (بدون لوپ بازگشتی و بدون کنسل کردن اجرای فعال)
+    - cron: "*/30 * * * *"
+
+permissions:
+  contents: write
+
+# جلوگیری از اجرای همزمان دو نمونه و جلوگیری از تداخل getUpdates تلگرام
+# cancel-in-progress: false مانع از کیل شدن ناگهانی و مکرر رانر در هر ۳۰ دقیقه می‌شود
+concurrency:
+  group: course-schedule-sync
+  cancel-in-progress: false
+
+jobs:
+  sync-schedule:
+    runs-on: ubuntu-latest
+    timeout-minutes: 32
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip --quiet
+          if [ -f requirements.txt ]; then pip install -r requirements.txt --quiet; fi
+
+      - name: Restore database state from cache
+        uses: actions/cache/restore@v4
+        with:
+          path: mehrmaz_bot.db
+          key: mehrmaz-db-${{ github.ref_name }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            mehrmaz-db-${{ github.ref_name }}-
+
+      - name: Record initial database digest
+        id: db_before
+        run: |
+          python3 -c '
+          import hashlib, os, sqlite3
+          db = "mehrmaz_bot.db"
+          if not os.path.exists(db):
+              print("digest=none")
+          else:
+              conn = sqlite3.connect(db)
+              dump = "\n".join(conn.iterdump())
+              conn.close()
+              print("digest=" + hashlib.sha256(dump.encode("utf-8")).hexdigest())
+          ' >> "$GITHUB_OUTPUT"
+
+      - name: Run schedule sync service
+        env:
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          ADMIN_ID: ${{ secrets.ADMIN_ID }}
+          ADMIN_USERNAME: ${{ secrets.ADMIN_USERNAME }}
+          ALLOWED_USER_IDS: ${{ secrets.ALLOWED_USER_IDS }}
+          DB_PATH: "mehrmaz_bot.db"
+          MAX_RUNTIME_SECONDS: "1500"
+        run: |
+          chmod +x run_workflow.sh
+          ./run_workflow.sh
+
+      - name: Persist database state cleanly
+        if: always()
+        env:
+          BEFORE_DIGEST: ${{ steps.db_before.outputs.digest }}
+        run: |
+          if [ -f "mehrmaz_bot.db" ]; then
+            CHANGED=$(python3 -c '
+          import hashlib, os, sqlite3
+          db = "mehrmaz_bot.db"
+          conn = sqlite3.connect(db)
+          conn.execute("PRAGMA wal_checkpoint(TRUNCATE);")
+          dump = "\n".join(conn.iterdump())
+          conn.close()
+          for ext in ("-wal", "-shm"):
+              if os.path.exists(db + ext):
+                  os.remove(db + ext)
+          after = hashlib.sha256(dump.encode("utf-8")).hexdigest()
+          before = os.environ.get("BEFORE_DIGEST", "none")
+          print("yes" if after != before else "no")
+          ')
+            if [ "$CHANGED" = "yes" ]; then
+              git config user.name "github-actions[bot]"
+              git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+              git add mehrmaz_bot.db || true
+              if ! git diff --staged --quiet; then
+                git commit -m "chore: update schedule state [skip ci]" || true
+                git pull --rebase origin "${GITHUB_REF_NAME:-main}" || true
+                git push origin HEAD || true
+              fi
+            else
+              echo "No database changes detected; skipping git commit to avoid commit spam."
+            fi
+          fi
+
+      - name: Save database state to cache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: mehrmaz_bot.db
+          key: mehrmaz-db-${{ github.ref_name }}-${{ github.run_id }}-${{ github.run_attempt }}
